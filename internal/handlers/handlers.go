@@ -1,0 +1,161 @@
+package handlers
+
+import (
+	"crypto/rand"
+	"errors"
+	"net/url"
+	"strings"
+
+	"github.com/AP1493/go-urlshortner/internal/models"
+	"github.com/gofiber/fiber/v2"
+	"gorm.io/gorm"
+)
+
+const shortCodeLength = 8
+
+type Handler struct {
+	db *gorm.DB
+}
+
+func NewHandler(db *gorm.DB) *Handler {
+	return &Handler{db: db}
+}
+
+type urlRequest struct {
+	URL string `json:"url"`
+}
+
+// normalizeURL trims the input and validates that it is an absolute http(s) URL.
+func normalizeURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", errors.New("url is required")
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", errors.New("url is not valid")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("url must start with http:// or https://")
+	}
+	if parsed.Host == "" {
+		return "", errors.New("url must contain a host")
+	}
+
+	return raw, nil
+}
+
+// GenerateRandomString returns a random base62 string of n characters. It uses
+// crypto/rand so short codes cannot be guessed or enumerated.
+func GenerateRandomString(n int) (string, error) {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = letters[int(b[i])%len(letters)]
+	}
+	return string(b), nil
+}
+
+// Create stores a new URL.
+func (h *Handler) Create(c *fiber.Ctx) error {
+	var req urlRequest
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+
+	value, err := normalizeURL(req.URL)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
+	shortenCode, err := GenerateRandomString(shortCodeLength)
+	if err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "could not generate short code")
+	}
+
+	record := models.URL{URL: value, ShortenCode: shortenCode}
+	if err := h.db.Create(&record).Error; err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "could not save URL")
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(record)
+}
+
+// Get returns a single URL by its ID.
+func (h *Handler) Get(c *fiber.Ctx) error {
+	var record models.URL
+	if err := h.db.First(&record, "shorten_code = ?", c.Params("shorten_code")).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "URL not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "could not fetch URL")
+	}
+
+	if err := h.db.Model(&record).UpdateColumn("count", gorm.Expr("count + 1")).Error; err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "could not update URL count")
+	}
+
+	return c.Redirect(record.URL, fiber.StatusFound)
+}
+
+// Delete removes a URL by its ID.
+func (h *Handler) Delete(c *fiber.Ctx) error {
+	result := h.db.Delete(&models.URL{}, "shorten_code = ?", c.Params("shorten_code"))
+	if result.Error != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "could not delete URL")
+	}
+	if result.RowsAffected == 0 {
+		return fiber.NewError(fiber.StatusNotFound, "URL not found")
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+// Stats returns the stored record, including its access count, without
+// redirecting or counting the lookup as a visit.
+func (h *Handler) Stats(c *fiber.Ctx) error {
+	var record models.URL
+	if err := h.db.First(&record, "shorten_code = ?", c.Params("shorten_code")).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "URL not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "could not fetch URL")
+	}
+
+	return c.JSON(record)
+}
+
+// Update repoints an existing short code at a new URL. The short code itself is
+// left alone so links already handed out keep working.
+func (h *Handler) Update(c *fiber.Ctx) error {
+	var req urlRequest
+	if err := c.BodyParser(&req); err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
+	}
+
+	value, err := normalizeURL(req.URL)
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
+	// Load the row first so the response carries the real id, count and
+	// timestamps, and so a missing short code is a 404 rather than a silent
+	// no-op update.
+	var record models.URL
+	if err := h.db.First(&record, "shorten_code = ?", c.Params("shorten_code")).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fiber.NewError(fiber.StatusNotFound, "URL not found")
+		}
+		return fiber.NewError(fiber.StatusInternalServerError, "could not fetch URL")
+	}
+
+	if err := h.db.Model(&record).Update("url", value).Error; err != nil {
+		return fiber.NewError(fiber.StatusInternalServerError, "could not update URL")
+	}
+
+	return c.JSON(record)
+}
