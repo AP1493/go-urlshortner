@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -15,10 +16,19 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// port is the address the server listens on inside its container or host.
+func port() string {
+	if v := strings.TrimSpace(os.Getenv("PORT")); v != "" {
+		return v
+	}
+	return "8080"
+}
+
 func main() {
-	err := godotenv.Load(".env")
-	if err != nil {
-		fmt.Println("Error loading .env file")
+	// .env is a local-development convenience. In Docker and on EC2 the values
+	// come from the real environment, so a missing file is not an error.
+	if err := godotenv.Load(".env"); err != nil {
+		fmt.Println("No .env file loaded, using environment variables")
 	}
 
 	db, err := postgres.InitPostgres()
@@ -34,9 +44,10 @@ func main() {
 
 	routes.SetupRoutes(app, handler)
 
+	addr := ":" + port()
 	errChn := make(chan error)
 	go func() {
-		errChn <- app.Listen(":8080")
+		errChn <- app.Listen(addr)
 	}()
 
 	quit := make(chan os.Signal, 1)

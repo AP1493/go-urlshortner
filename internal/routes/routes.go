@@ -6,9 +6,11 @@ import (
 )
 
 func SetupRoutes(app *fiber.App, handler *handlers.Handler) {
-	app.Get("/", func(c *fiber.Ctx) error {
-		return c.SendString("Welcome to the URL API!")
-	})
+	app.Get("/healthz", handler.Health)
+
+	// Server-rendered pages.
+	app.Get("/", handler.Home)
+	app.Post("/", handler.ShortenForm)
 
 	shorten := app.Group("/shorten")
 	shorten.Post("/", handler.Create)

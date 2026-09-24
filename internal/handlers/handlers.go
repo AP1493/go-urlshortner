@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/AP1493/go-urlshortner/internal/models"
@@ -14,15 +15,26 @@ import (
 const shortCodeLength = 8
 
 type Handler struct {
-	db *gorm.DB
+	db      *gorm.DB
+	baseURL string
 }
 
 func NewHandler(db *gorm.DB) *Handler {
-	return &Handler{db: db}
+	return &Handler{db: db, baseURL: baseURL()}
+}
+
+// baseURL is the public origin short links are built from. It has to be
+// configured because the app may sit behind a proxy or a different port than it
+// listens on.
+func baseURL() string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("BASE_URL")), "/"); v != "" {
+		return v
+	}
+	return "http://localhost:8080"
 }
 
 type urlRequest struct {
-	URL string `json:"url"`
+	URL string `json:"url" form:"url"`
 }
 
 // normalizeURL trims the input and validates that it is an absolute http(s) URL.
@@ -60,6 +72,33 @@ func GenerateRandomString(n int) (string, error) {
 	return string(b), nil
 }
 
+// createURL validates the raw input, mints a short code and stores the row. It
+// is shared by the JSON API and the HTML form, and always fails with a
+// *fiber.Error so callers can tell a bad input (400) from a server fault (500).
+func (h *Handler) createURL(raw string) (models.URL, error) {
+	value, err := normalizeURL(raw)
+	if err != nil {
+		return models.URL{}, fiber.NewError(fiber.StatusBadRequest, err.Error())
+	}
+
+	shortenCode, err := GenerateRandomString(shortCodeLength)
+	if err != nil {
+		return models.URL{}, fiber.NewError(fiber.StatusInternalServerError, "could not generate short code")
+	}
+
+	record := models.URL{URL: value, ShortenCode: shortenCode}
+	if err := h.db.Create(&record).Error; err != nil {
+		return models.URL{}, fiber.NewError(fiber.StatusInternalServerError, "could not save URL")
+	}
+
+	return record, nil
+}
+
+// shortURL builds the full link handed back to the user for a short code.
+func (h *Handler) shortURL(code string) string {
+	return h.baseURL + "/shorten/" + code
+}
+
 // Create stores a new URL.
 func (h *Handler) Create(c *fiber.Ctx) error {
 	var req urlRequest
@@ -67,19 +106,9 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 		return fiber.NewError(fiber.StatusBadRequest, "invalid JSON body")
 	}
 
-	value, err := normalizeURL(req.URL)
+	record, err := h.createURL(req.URL)
 	if err != nil {
-		return fiber.NewError(fiber.StatusBadRequest, err.Error())
-	}
-
-	shortenCode, err := GenerateRandomString(shortCodeLength)
-	if err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "could not generate short code")
-	}
-
-	record := models.URL{URL: value, ShortenCode: shortenCode}
-	if err := h.db.Create(&record).Error; err != nil {
-		return fiber.NewError(fiber.StatusInternalServerError, "could not save URL")
+		return err
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(record)
