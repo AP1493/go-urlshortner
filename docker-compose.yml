@@ -40,8 +40,10 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      # Falls back to the redis service above. Set REDIS_HOST (and REDIS_TLS)
+      # in .env to use ElastiCache instead.
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PORT: ${REDIS_PORT:-6379}
       APP_ENV: production
     depends_on:
       redis:

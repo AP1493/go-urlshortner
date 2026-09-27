@@ -11,6 +11,7 @@ import (
 
 	"github.com/AP1493/go-urlshortner/internal/handlers"
 	"github.com/AP1493/go-urlshortner/internal/postgres"
+	"github.com/AP1493/go-urlshortner/internal/redis"
 	"github.com/AP1493/go-urlshortner/internal/routes"
 	"github.com/AP1493/go-urlshortner/internal/server"
 	"github.com/joho/godotenv"
@@ -38,7 +39,14 @@ func main() {
 	}
 	defer db.Close()
 
-	handler := handlers.NewHandler(db.DB())
+	rdb, err := redis.InitRedis()
+	if err != nil {
+		fmt.Println("Error initializing Redis:", err)
+		return
+	}
+	defer rdb.Close()
+
+	handler := handlers.NewHandler(db.DB(), rdb.Client())
 
 	app := server.NewFiberServer()
 

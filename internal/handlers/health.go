@@ -17,3 +17,14 @@ func (h *Handler) Health(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{"status": "ok", "database": "ok"})
 }
+
+// RedisHealth pings Redis and sends back its reply, "PONG", as plain text. Like
+// Health it answers 503 rather than an error page when Redis is unreachable.
+func (h *Handler) RedisHealth(c *fiber.Ctx) error {
+	pong, err := h.rdb.Ping(c.Context()).Result()
+	if err != nil {
+		return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"status": "error", "redis": "unreachable"})
+	}
+
+	return c.SendString(pong)
+}

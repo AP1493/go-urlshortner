@@ -7,6 +7,7 @@ import (
 
 func SetupRoutes(app *fiber.App, handler *handlers.Handler) {
 	app.Get("/healthz", handler.Health)
+	app.Get("/redis-health", handler.RedisHealth)
 
 	// Server-rendered pages.
 	app.Get("/", handler.Home)

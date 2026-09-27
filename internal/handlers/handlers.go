@@ -9,6 +9,7 @@ import (
 
 	"github.com/AP1493/go-urlshortner/internal/models"
 	"github.com/gofiber/fiber/v2"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 )
 
@@ -16,11 +17,12 @@ const shortCodeLength = 8
 
 type Handler struct {
 	db      *gorm.DB
+	rdb     *redis.Client
 	baseURL string
 }
 
-func NewHandler(db *gorm.DB) *Handler {
-	return &Handler{db: db, baseURL: baseURL()}
+func NewHandler(db *gorm.DB, rdb *redis.Client) *Handler {
+	return &Handler{db: db, rdb: rdb, baseURL: baseURL()}
 }
 
 // baseURL is the public origin short links are built from. It has to be
@@ -114,21 +116,37 @@ func (h *Handler) Create(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(record)
 }
 
-// Get returns a single URL by its ID.
+// Get redirects a short code to its URL. The code -> URL lookup is served from
+// Redis when cached, falling back to Postgres; the visit is always counted in
+// Postgres.
 func (h *Handler) Get(c *fiber.Ctx) error {
-	var record models.URL
-	if err := h.db.First(&record, "shorten_code = ?", c.Params("shorten_code")).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return fiber.NewError(fiber.StatusNotFound, "URL not found")
+	code := c.Params("shorten_code")
+
+	target, cached := h.cachedURL(c.Context(), code)
+	if !cached {
+		var record models.URL
+		if err := h.db.First(&record, "shorten_code = ?", code).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fiber.NewError(fiber.StatusNotFound, "URL not found")
+			}
+			return fiber.NewError(fiber.StatusInternalServerError, "could not fetch URL")
 		}
-		return fiber.NewError(fiber.StatusInternalServerError, "could not fetch URL")
+		target = record.URL
+		h.cacheURL(c.Context(), code, target)
 	}
 
-	if err := h.db.Model(&record).UpdateColumn("count", gorm.Expr("count + 1")).Error; err != nil {
+	result := h.db.Model(&models.URL{}).Where("shorten_code = ?", code).UpdateColumn("count", gorm.Expr("count + 1"))
+	if result.Error != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "could not update URL count")
 	}
+	if result.RowsAffected == 0 {
+		// Only reachable on a cache hit for a row that is gone, e.g. a delete
+		// whose cache eviction failed. Drop the stale entry.
+		h.uncacheURL(c.Context(), code)
+		return fiber.NewError(fiber.StatusNotFound, "URL not found")
+	}
 
-	return c.Redirect(record.URL, fiber.StatusFound)
+	return c.Redirect(target, fiber.StatusFound)
 }
 
 // Delete removes a URL by its ID.
@@ -140,6 +158,7 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 	if result.RowsAffected == 0 {
 		return fiber.NewError(fiber.StatusNotFound, "URL not found")
 	}
+	h.uncacheURL(c.Context(), c.Params("shorten_code"))
 
 	return c.SendStatus(fiber.StatusNoContent)
 }
@@ -185,6 +204,7 @@ func (h *Handler) Update(c *fiber.Ctx) error {
 	if err := h.db.Model(&record).Update("url", value).Error; err != nil {
 		return fiber.NewError(fiber.StatusInternalServerError, "could not update URL")
 	}
+	h.uncacheURL(c.Context(), record.ShortenCode)
 
 	return c.JSON(record)
 }

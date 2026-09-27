@@ -1,6 +1,6 @@
 # go-urlshortner
 
-A URL shortening service written in Go with Fiber, GORM and PostgreSQL.
+A URL shortening service written in Go with Fiber, GORM, PostgreSQL and Redis.
 
 Built as a solution to the [URL Shortening Service](https://roadmap.sh/projects/url-shortening-service)
 project from roadmap.sh.
@@ -13,6 +13,7 @@ project from roadmap.sh.
 | HTTP | [Fiber v2](https://github.com/gofiber/fiber) |
 | ORM | [GORM](https://gorm.io) + `gorm.io/driver/postgres` |
 | Database | PostgreSQL 16 |
+| Cache | Redis 7.2 via [go-redis v9](https://github.com/redis/go-redis) |
 | Config | `.env` via [godotenv](https://github.com/joho/godotenv) |
 | Runtime | Docker Compose |
 
@@ -22,9 +23,10 @@ project from roadmap.sh.
 cmd/main.go                  entrypoint: config, DB, routes, graceful shutdown
 internal/server/server.go    Fiber app construction (timeouts, app name)
 internal/postgres/           connection, pooling, AutoMigrate
+internal/redis/              Redis client, startup ping
 internal/models/url.go       URL model
 internal/routes/routes.go    route table
-internal/handlers/           request handlers (the CRUD)
+internal/handlers/           request handlers (the CRUD, health, redirect cache)
 ```
 
 ## Configuration
@@ -44,6 +46,17 @@ DB_PORT=5432
 
 `DB_HOST` is the Compose **service name**, not `localhost` — inside the app
 container `localhost` refers to the app container itself.
+
+Redis is configured with `REDIS_HOST`, `REDIS_PORT`, `REDIS_TLS` and an
+optional `REDIS_PASSWORD`. Compose falls back to its own `redis` service when
+`REDIS_HOST` is unset; outside Docker the default is `localhost:6379`. The app
+pings Redis at startup and exits if it cannot reach it.
+
+For ElastiCache, set `REDIS_HOST` to the primary endpoint and `REDIS_TLS=true`
+when in-transit encryption is enabled; the server certificate is verified
+against the system CA roots. Set `REDIS_PASSWORD` to the AUTH token if one is
+configured. Only cluster-mode-disabled replication groups are supported: the
+app uses a plain client, not a cluster client.
 
 > `.env` holds a plaintext password. Add it to `.gitignore` and commit a
 > `.env.example` with blank values instead. These credentials are for local
@@ -108,6 +121,16 @@ repeat code can never be stored; there is no retry, a collision simply fails wit
 `500`. With 8 base62 characters that is vanishingly rare, and handling it is left
 out to keep the project simple.
 
+### `GET /redis-health` — Redis liveness
+
+```bash
+curl http://localhost:3001/redis-health
+```
+
+Responds `200` with the plain-text body `PONG` (Redis's reply to `PING`), or
+`503` with `{"status":"error","redis":"unreachable"}` if Redis cannot be reached.
+`GET /healthz` does the same for Postgres.
+
 ### `GET /shorten/:shorten_code` — resolve and redirect
 
 ```bash
@@ -124,6 +147,12 @@ the target for good.
 The counter is incremented with a SQL expression (`count = count + 1`) rather
 than a read-modify-write, so simultaneous hits cannot lose updates. It also
 leaves `updated_at` alone — visiting a link is not a modification of the record.
+
+The code → URL lookup is cached in Redis under `url:<code>` for one hour, so
+repeat visits skip the Postgres read; the count is still incremented in
+Postgres on every visit. `PUT` and `DELETE` evict the key. Redis is treated as
+a cache only: if it errors mid-request the app logs it and falls back to
+Postgres.
 
 `404` if no URL has that code.
 
@@ -228,7 +257,8 @@ validation, per-URL access counting, creation/modification timestamps, and CRUD.
 - No list-all endpoint.
 - A short-code collision is not retried; it fails with `500`. See
   [`POST /shorten`](#post-shorten--create).
-- Redis is declared in `docker-compose.yml` but nothing in the Go code uses it.
+- A failed cache eviction, or an update racing a cache fill, can leave a stale
+  redirect target in Redis for up to the one-hour TTL.
 
 ## Development
 
